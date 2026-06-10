@@ -265,6 +265,22 @@ class WebRecord:
 
 
 @dataclass
+class CredentialRecord:
+    username: str = ""
+    domain: str = ""
+    auth_id: str = ""
+    session: str = ""
+    logon_server: str = ""
+    logon_time: str = ""
+    sid: str = ""
+    ntlm: str = ""
+    sha1: str = ""
+    dpapi: str = ""
+    passwords: list = field(default_factory=list)
+    modules: list = field(default_factory=list)
+
+
+@dataclass
 class HostRecord:
     ip: str
     alive: bool = False
@@ -348,6 +364,7 @@ class FscanParser:
         self.routes = []
         self.all_ips = []
         self.unmatched_interesting = []
+        self.credentials = []
 
     def get_host(self, ip):
         if not valid_ip(ip):
@@ -370,6 +387,8 @@ class FscanParser:
             self.parse_webtitle(line)
             self.parse_netinfo_osinfo(line)
             self.parse_vuln_and_creds(line)
+
+        self.parse_mimikatz()
 
         return self
 
@@ -570,6 +589,117 @@ class FscanParser:
 
             h.raw_hits.append(safe_line)
 
+    def parse_mimikatz(self):
+        if "Authentication Id" not in self.text or "sekurlsa::logonpasswords" not in self.text.lower():
+            return
+
+        records = {}
+        blocks = re.split(r'(?=^Authentication Id\s*:)', self.text, flags=re.M)
+        for block in blocks:
+            if not block.lstrip().startswith("Authentication Id"):
+                continue
+
+            module_values = defaultdict(dict)
+            current_module = ""
+            for raw_line in block.splitlines():
+                line = raw_line.rstrip()
+                m_module = re.match(r'^\s*([A-Za-z0-9_]+)\s*:\s*$', line)
+                if m_module:
+                    current_module = m_module.group(1).lower()
+                    continue
+
+                m_value = re.match(r'^\s*\*\s*(Username|Domain|Password|NTLM|SHA1|DPAPI)\s*:\s*(.*)$', line, re.I)
+                if not m_value:
+                    continue
+
+                key = m_value.group(1).lower()
+                value = one_line(m_value.group(2))
+                if not value or value.lower() == "(null)":
+                    continue
+                module_values[current_module][key] = value
+
+            preferred = module_values.get("msv") or module_values.get("kerberos") or {}
+            username = preferred.get("username") or self.mimikatz_first_value(module_values, "username")
+            domain = preferred.get("domain") or self.mimikatz_first_value(module_values, "domain")
+            if not username or username.lower() == "(null)":
+                username = self.extract_mimikatz_header_field(block, "User Name")
+            if not domain or domain.lower() == "(null)":
+                domain = self.extract_mimikatz_header_field(block, "Domain")
+
+            ntlm = self.mimikatz_first_value(module_values, "ntlm")
+            sha1 = self.mimikatz_first_value(module_values, "sha1")
+            dpapi = self.mimikatz_first_value(module_values, "dpapi")
+            passwords = []
+            modules = []
+            for module, values in module_values.items():
+                if values:
+                    modules.append(module)
+                password = self.normalize_mimikatz_password(values.get("password", ""))
+                if password:
+                    passwords.append(f"{module}:{password}")
+
+            if not any([ntlm, sha1, dpapi, passwords]):
+                continue
+            if not username or username.lower() in {"(null)", "local service", "network service"}:
+                continue
+
+            rec = CredentialRecord(
+                username=username,
+                domain=domain,
+                auth_id=self.extract_mimikatz_header_field(block, "Authentication Id"),
+                session=self.extract_mimikatz_header_field(block, "Session"),
+                logon_server=self.extract_mimikatz_header_field(block, "Logon Server"),
+                logon_time=self.extract_mimikatz_header_field(block, "Logon Time"),
+                sid=self.extract_mimikatz_header_field(block, "SID"),
+                ntlm=ntlm,
+                sha1=sha1,
+                dpapi=dpapi,
+                passwords=unique_keep_order(passwords),
+                modules=unique_keep_order(modules),
+            )
+
+            dedup_key = (
+                rec.username.lower(),
+                rec.domain.lower(),
+                rec.ntlm.lower(),
+                rec.sha1.lower(),
+                rec.dpapi.lower(),
+                tuple(rec.passwords),
+            )
+            if dedup_key in records:
+                old = records[dedup_key]
+                old.modules = unique_keep_order(old.modules + rec.modules)
+                if rec.auth_id and rec.auth_id not in old.auth_id:
+                    old.auth_id = f"{old.auth_id}, {rec.auth_id}" if old.auth_id else rec.auth_id
+                continue
+
+            records[dedup_key] = rec
+
+        self.credentials = list(records.values())
+
+    def extract_mimikatz_header_field(self, block, field_name):
+        m = re.search(rf'^\s*{re.escape(field_name)}\s*:\s*(.*)$', block, re.M)
+        return one_line(m.group(1)) if m else ""
+
+    def mimikatz_first_value(self, module_values, key):
+        for module in ["msv", "wdigest", "kerberos", "tspkg", "ssp", "credman", "cloudap"]:
+            value = module_values.get(module, {}).get(key, "")
+            if value:
+                return value
+        for values in module_values.values():
+            value = values.get(key, "")
+            if value:
+                return value
+        return ""
+
+    def normalize_mimikatz_password(self, value):
+        value = one_line(value)
+        if not value or value.lower() == "(null)":
+            return ""
+        if re.fullmatch(r'(?:[0-9a-fA-F]{2}\s+){16,}[0-9a-fA-F]{2}', value):
+            return f"hex_blob:{len(value.split())}bytes"
+        return "******" if self.mask_password else value
+
     def sorted_hosts(self):
         return [self.hosts[ip] for ip in sorted(self.hosts.keys(), key=ip_sort_key)]
 
@@ -587,6 +717,7 @@ class FscanParser:
         lines.append(f"- Web 资产数：{sum(len(h.webs) for h in hosts)}")
         lines.append(f"- 疑似漏洞记录：{sum(len(h.vulns) for h in hosts)}")
         lines.append(f"- 凭据/弱口令/匿名登录记录：{sum(len(h.creds) for h in hosts)}")
+        lines.append(f"- Mimikatz 凭据记录：{len(self.credentials)}")
         lines.append(f"- 网卡/接口数：{len(self.interfaces)}")
         lines.append("")
 
@@ -691,7 +822,22 @@ class FscanParser:
                 lines.append(f"- `{x}`")
             lines.append("")
 
-        lines.append("## 7. 红队整理建议")
+        if self.credentials:
+            lines.append("## 7. Mimikatz 凭据整理")
+            lines.append("")
+            lines.append("| 账号 | Session | Logon Time | NTLM | SHA1 | DPAPI | Password | 来源 |")
+            lines.append("|---|---|---|---|---|---|---|---|")
+            for rec in sorted(self.credentials, key=lambda x: (x.domain.lower(), x.username.lower())):
+                identity = f"{rec.domain}\\{rec.username}" if rec.domain else rec.username
+                rows_password = "<br>".join(rec.passwords) if rec.passwords else "-"
+                lines.append(
+                    f"| {identity} | {rec.session or '-'} | {rec.logon_time or '-'} | "
+                    f"{rec.ntlm or '-'} | {rec.sha1 or '-'} | {rec.dpapi or '-'} | "
+                    f"{rows_password} | {', '.join(rec.modules) if rec.modules else '-'} |"
+                )
+            lines.append("")
+
+        lines.append("## 8. 红队整理建议")
         lines.append("")
         lines.append("- 优先关注风险等级为“高”的主机。")
         lines.append("- 优先复核包含弱口令、匿名访问、未授权、CVE、PocScan 命中的记录。")
@@ -878,6 +1024,46 @@ class FscanParser:
 
             rows.append("")
 
+        credential_text = self.build_credential_copy_text()
+        if credential_text:
+            if rows:
+                rows.append("")
+            rows.append(credential_text)
+
+        return "\n".join(rows).rstrip()
+
+    def build_credential_copy_text(self):
+        if not self.credentials:
+            return ""
+
+        rows = []
+        rows.append("Credential Summary")
+        rows.append("=" * 72)
+        rows.append(f"Unique credential records: {len(self.credentials)}")
+        rows.append("")
+
+        for rec in sorted(self.credentials, key=lambda x: (x.domain.lower(), x.username.lower())):
+            identity = f"{rec.domain}\\{rec.username}" if rec.domain else rec.username
+            rows.append(identity)
+            if rec.session or rec.logon_time:
+                meta = []
+                if rec.session:
+                    meta.append(f"session={rec.session}")
+                if rec.logon_time:
+                    meta.append(f"logon={rec.logon_time}")
+                rows.append("  " + "  ".join(meta))
+            if rec.ntlm:
+                rows.append(f"  NTLM : {rec.ntlm}")
+            if rec.sha1:
+                rows.append(f"  SHA1 : {rec.sha1}")
+            if rec.dpapi:
+                rows.append(f"  DPAPI: {rec.dpapi}")
+            for password in rec.passwords:
+                rows.append(f"  PASS : {password}")
+            if rec.modules:
+                rows.append(f"  src  : {', '.join(rec.modules)}")
+            rows.append("")
+
         return "\n".join(rows).rstrip()
 
     def port_correction_note(self, p):
@@ -901,8 +1087,10 @@ class FscanParser:
                 "hosts": len(self.hosts),
                 "interfaces": self.interfaces,
                 "routes": self.routes,
+                "credentials": len(self.credentials),
             },
-            "hosts": []
+            "hosts": [],
+            "credentials": [asdict(c) for c in self.credentials],
         }
 
         for h in self.sorted_hosts():
@@ -944,7 +1132,7 @@ class App:
         ttk.Button(toolbar, text="整理", command=self.do_parse).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="加载示例", command=self.load_sample).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="清空", command=self.clear_all).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="复制清单", command=self.copy_report).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text="复制结果", command=self.copy_report).pack(side=tk.LEFT, padx=5)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
@@ -968,7 +1156,7 @@ class App:
         self.input_text = scrolledtext.ScrolledText(left, wrap=tk.WORD, font=("Consolas", 10))
         self.input_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
-        ttk.Label(right, text="可复制端口清单：右侧点一下，Ctrl+A / Ctrl+C 直接复制").pack(anchor="w")
+        ttk.Label(right, text="可复制整理结果：右侧点一下，Ctrl+A / Ctrl+C 直接复制").pack(anchor="w")
         self.output_text = scrolledtext.ScrolledText(right, wrap=tk.NONE, font=("Consolas", 12))
         self.output_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
@@ -1145,13 +1333,13 @@ class App:
     def copy_report(self):
         content = self.output_text.get("1.0", tk.END).strip()
         if not content:
-            messagebox.showinfo("提示", "右侧清单为空。")
+            messagebox.showinfo("提示", "右侧整理结果为空。")
             return
 
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
         self.root.update()
-        messagebox.showinfo("提示", "端口清单已复制，可直接粘贴到 Excel / Word / Markdown。")
+        messagebox.showinfo("提示", "整理结果已复制，可直接粘贴到记录里。")
 
     def ensure_parsed(self):
         if self.parser is None:
